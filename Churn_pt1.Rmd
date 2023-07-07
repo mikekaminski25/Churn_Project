@@ -20,10 +20,16 @@ library(tidyverse)
 
 ```{r}
 churn <- read.csv("C:/Users/mikek/Desktop/Churn/Churn_Project/customer_churn_dataset-training-master.csv")
-churn <- churn %>% select(-CustomerID)
+churn <- churn %>% 
+  mutate(Churn = ifelse(Churn == 1, "Churn","No Churn")) %>%
+  mutate(Churn = as.factor(Churn))
+# churn <- churn %>% select(-CustomerID)
 
 churn_test <- read.csv("C:/Users/mikek/Desktop/Churn/Churn_Project/customer_churn_dataset-testing-master.csv")
-churn_test <- churn_test %>% select(-CustomerID)
+churn_test <- churn_test %>%
+  mutate(Churn = ifelse(Churn == 1, "Churn","No Churn")) %>%
+  mutate(Churn = as.factor(Churn))
+# churn_test <- churn_test %>% select(-CustomerID)
 ```
 
 # EDA
@@ -133,8 +139,6 @@ df <- rbind(churn, churn_test) %>% na.omit(.)
 
 ```{r}
 summary(df)
-df %>%
-  filter_all(any_vars(is.na(.)))
 ```
 
 
@@ -170,6 +174,8 @@ df %>%
 
 
 # Modeling
+## Data Splitting
+The rsample package includes the initial_split function.  Strata is used to conduct stratified sampling, which I'll use for the Churn variable.  There's a prop argument within intial_split which defaults to 3/4.  The training and testing functions create the training and testing datasets
 ```{r}
 set.seed(123)
 churn_split <- initial_split(df, strata = Churn)
@@ -177,34 +183,272 @@ churn_train <- training(churn_split)
 churn_test <- testing(churn_split)
 ```
 
-Double Check some of the fields from the initial dataset.  Looks good
+Double Check some of the fields from the initial dataset.  Looks good.
 ```{r}
 churn_train %>% filter(Age >50) %>% count(Churn)
 churn_test %>% filter(Age >50) %>% count(Churn)
 churn_train %>% filter(Total.Spend <500) %>% count(Churn)
 churn_test %>% filter(Total.Spend <500) %>% count(Churn)
 ```
+## Create Recipe, Roles, and Features
+Before training the model, a recipe is created to conduct some of the preprocessing requirements.  This can also be used to create new predictors.
+
+The update_role function allows for creating custom roles.  In the below, I don't want to include CUstomerID in the model, but I want to be able to reference the variable after the model is fit to investigate poorly predicted values.
+
+Recipes do not automatically create dummy variables - it needs to be told to do so.  The recipe knows all the variable types, so all_nominal_predictors selector function is used to create dummy variables for the categorical predictors - Gender, Subscription.Type, and Contract.Length
 
 ```{r}
-glm_spec <- logistic_reg() %>%
+churn_rec <-
+  recipe(Churn ~ ., data = churn_train) %>%
+  update_role(CustomerID, new_role = "ID") %>% # this omits from the model and can be used to help investigate poorly predicted values
+  step_dummy(all_nominal_predictors()) # creates dummy variables for nominal predictors
+
+summary(churn_rec)
+```
+
+## Fit a model with a recipe
+A model specification is built using the parsnip package.  We want to use the recipe across several steps as we train and test the model.
+* Process the recipe with the training dataset - this will determine which variables need to be converted to dummy variables
+* Apply the recipe to the training dataset - a final predictor set is created on the training dataset
+* Apply the recipe to the testing dataset - a final predictor set is created on the testing dataset.  Nothing is recomputed and no info from the test set is used.  The dummy variable results from the training set are applied to the test set
+
+```{r}
+lr_mod <-
+  logistic_reg() %>%
   set_engine("glm")
-
-rf_spec <- rand_forest() %>%
-  set_mode("classification") %>%
-  set_engine("ranger")
-
 ```
 
-```{r}
-churn_wf <- workflow() %>%
-  add_formula(churn ~ .)
+To simplify the process, a model workflow is created, which pairs the model and the recipe together.
+* Different recipes are usually needed for different models, so when they're bundled, it becomes easier to train and test the workflows.  The workflows package from tidymodels can bunlde the parnsip model (lr_mod) and the recipe (churn_rec)
 
+```{r}
+churn_wf <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(churn_rec)
 ```
 
+
 ```{r}
-churn_wf %>%
-  add_model(glm_spec) %>%
+churn_fit <- 
+  churn_wf %>% 
   fit(data = churn_train)
+```
 
+There's a single function that can be used to prepare the recipe and train the model from the predictors.  This object has the final recipe and fitted model inside of it.  We're able to extract the model or recipe objects from the workflow. <br>
+
+The helper function extract_fit_parsnip and extract_recipe are used to accomplish this.<br>
+
+The tidy() function from broom provides a tidy tibble of the model coefficients.
+
+```{r}
+churn_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+
+churn_fit %>%
+  extract_recipe() %>%
+  tidy()
+```
+
+## Use a Trained Workflow to Predict
+We now cna used the trained workflow to predict the unseen test data, which can be done with a single call to predict()
+```{r}
+predict(churn_fit, churn_test)
+```
+This returns the predicted value of Churn, with 1 indicating the customer churned.  We can also get the probabilities for each predicted class
+* we can use type = "prob" or we can use augment()
+```{r}
+predict(churn_fit, churn_test,type = "prob")
+
+churn_aug <-
+  augment(churn_fit,churn_test)
+
+churn_aug %>%
+  select(Churn, Gender, Usage.Frequency, .pred_class, .pred_Churn) %>%
+  head(10)
+
+```
+
+Initially, it doesn't look like it's predicting well - Churn and .pred_class don't match in the first 10.  We'll explore that a bit later in the analysis <br>
+
+Now that we have a tibble with our predicted class probabilities, we need to evaluate the performance of the workflow.  A cutoff of p > 0.50 is used to predict Churn. <br>
+
+We can use roc_curve and roc_auc from the yardstick package to evaluate
+
+```{r}
+churn_aug %>%
+  roc_curve(truth = Churn, .pred_Churn) %>%
+  autoplot()
+
+```
+
+```{r}
+churn_aug %>%
+  roc_auc(truth = Churn, .pred_Churn)
+```
+This value looks pretty good.
+
+# Modeling Part 2
+Let's take a look at the proportions of the categorical vairables.  If there's class imbalance, we may want to adjust the strata of the model.
+```{r}
+df %>% 
+  count(Gender) %>% 
+  mutate(prop = n/sum(n))
+
+df %>% 
+  count(Subscription.Type) %>% 
+  mutate(prop = n/sum(n))
+
+df %>% 
+  count(Contract.Length) %>% 
+  mutate(prop = n/sum(n))
+
+df %>% 
+  count(Churn) %>% 
+  mutate(prop = n/sum(n))
+```
+They're all pretty evenly distributed, but we'll apply the strata regardless
+```{r}
+
+df <- rbind(churn, churn_test) %>% na.omit(.)
+
+set.seed(123)
+df <- df %>%
+  mutate(stratas = paste0(Churn, Gender, Subscription.Type, Contract.Length))
+
+churn_split <- initial_split(df, strata = stratas)
+churn_train <- training(churn_split)
+churn_test <- testing(churn_split)
+```
+
+```{r}
+churn_train %>% 
+  count(stratas) %>% 
+  mutate(prop = n/sum(n)) %>%
+  head(10)
+
+churn_test %>% 
+  count(stratas) %>% 
+  mutate(prop = n/sum(n))%>%
+  head(10)
+
+```
+There are 36 combinations of the 4 categorical variables.  Both the train and test datasets have about 3% in each.
+
+The stratas variable is not longer needed, so we can remove from the train and test datasets.  This way we can use the same recipe and workflow from before without having to amend.
+```{r}
+churn_train <- churn_train %>% select(-stratas)
+churn_test <- churn_test %>% select(-stratas)
+
+```
+
+Fit the model
+```{r}
+churn_fit <- 
+  churn_wf %>% 
+  fit(data = churn_train)
+```
+
+Review the coefficients
+```{r}
+churn_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+
+```
+
+```{r}
+predict(churn_fit, churn_test,type = "prob")
+
+churn_aug <-
+  augment(churn_fit,churn_test)
+
+churn_aug %>%
+  select(Churn, Gender, Usage.Frequency, .pred_class, .pred_Churn) %>%
+  # filter(.pred_Churn >= 0.49, .pred_Churn <= 0.51) %>%
+  head(10)
+
+```
+This looks a little better than before, at least from the top 10 - they're almost all correct.
+```{r}
+churn_aug %>%
+  roc_curve(truth = Churn, .pred_Churn) %>%
+  autoplot()
+```
+
+```{r}
+churn_aug %>%
+  roc_auc(truth = Churn, .pred_Churn)
+```
+This is nearly up 5% - was previously ~0.90 without the multiple strata split. 
+
+I'll try a different model to see if the results improve
+
+## Modeling Part 3 - Random Forest
+Random forests are ensembles of decision trees.  A large number of decision trees are created for the ensemble based on slightly different versions of the training data.  The collection of trees are combined into the rf model and when a new sample is predicted, the votes from each tree are used to calculate the final predicted value for the new sample.
+
+Some of the benefits of random forest si that it's very low maintenance - there's little prepossessing and the default parameters tend to give reasonable results.  We don't need a recipe for this, which is generally used when prepossessing steps are needed.
+
+However, the number of trees in the ensemble should be large, which makes this a bit time consuming to compute - our training set has 400,000+ rows
+```{r}
+rf_mod <- 
+  rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>%  # this is generally used in a random forest model.  glm was used for linear regression
+  set_mode("classification")
+```
+
+```{r}
+set.seed(234)
+rf_fit <- 
+  rf_mod %>% 
+  fit(Churn ~ ., data = churn_train)
+rf_fit
+```
+We want to test performance on the test data set.  I've included the performance evaluation on the train set, which is incorrect, but wanted to show for reference.
+```{r}
+rf_training_pred <- 
+  predict(rf_fit, churn_train) %>% 
+  bind_cols(predict(rf_fit, churn_train, type = "prob")) %>% 
+  # Add the true outcome data back in
+  bind_cols(churn_train %>% 
+              select(Churn))
+```
+
+The test set actually performed quite well.
+```{r}
+rf_training_pred %>%                   
+  roc_auc(truth = Churn, .pred_Churn)
+
+rf_training_pred %>%                   
+  accuracy(truth = Churn, .pred_class)
+
+```
+
+```{r}
+rf_testing_pred <- 
+  predict(rf_fit, churn_test) %>% 
+  bind_cols(predict(rf_fit, churn_test, type = "prob")) %>% 
+  bind_cols(churn_test %>% select(Churn))
+
+```
+
+```{r}
+rf_testing_pred %>%                   
+  roc_auc(truth = Churn, .pred_Churn)
+
+rf_testing_pred %>%                   
+  accuracy(truth = Churn, .pred_class)
+
+```
+
+If the results weren't doing so well, we could try resampling the data using cross-validation or bootstrapping
+
+With cross-validation, generally 10-fold is a good place to start.  With 10-fold, 10% of the data is held out of the model - so 42,000~ rows - which is similar to a test set.  The other 90% are used to fit the model.  At the end, 10 sets of performance statistics are created - 10 accuracies and 10 roc_aucs.  The final resmapling estimates for the model are the averages of the performance stats.
+
+```{r}
+set.seed(345)
+folds <- vfold_cv(churn_train, v = 10)
+folds
 ```
 
