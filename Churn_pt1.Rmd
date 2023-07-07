@@ -1,0 +1,210 @@
+---
+title: "Churn Data"
+author: "Mike Kaminski"
+date: "2023-07-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, warning = FALSE,
+                      message = FALSE, dpi = 180,
+                      fig.width = 10, fig.height = 5)
+```
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+# https://www.kaggle.com/datasets/muhammadshahidazeem/customer-churn-dataset?select=customer_churn_dataset-training-master.csv
+```
+
+
+```{r}
+churn <- read.csv("C:/Users/mikek/Desktop/Churn/Churn_Project/customer_churn_dataset-training-master.csv")
+churn <- churn %>% select(-CustomerID)
+
+churn_test <- read.csv("C:/Users/mikek/Desktop/Churn/Churn_Project/customer_churn_dataset-testing-master.csv")
+churn_test <- churn_test %>% select(-CustomerID)
+```
+
+# EDA
+## Understanding the data
+* Not much info was given on the data, but that's okay.  I'm going to make some assumptions.
+
+
+### Age
+```{r tenure_age_plot}
+churn %>%
+  sample_n(10000) %>% # take a sample of the data for faster processing
+  ggplot(aes(Tenure, Age, color = Churn)) +
+  geom_point()
+
+churn %>% filter(Age >50) %>% count(Churn)
+
+```
+
+It appears that anyone over 50 churns.  These rows can be removed from the dataset since we're trying to predict churn vs not churn.
+
+```{r}
+churn50 <- churn %>%
+  filter(Age <=50)
+```
+
+### Total.Spend
+```{r tenure_spend_plot}
+churn50 %>%
+  sample_n(10000) %>% # take a sample of the data for faster processing
+  ggplot(aes(Tenure, Total.Spend, color = Churn)) +
+  geom_point()
+
+churn50 %>% filter(Total.Spend <500) %>% count(Churn)
+```
+It also appears that total.spend indicates churn - less than 500 means they churn.  These rows can also be removed
+
+```{r}
+churn500 <- churn50 %>%
+  filter(Total.Spend >=500)
+```
+
+### Support.Calls
+```{r}
+churn500 %>%
+  sample_n(10000) %>% # take a sample of the data for faster processing
+  ggplot(aes(Tenure, Support.Calls, color = Churn)) +
+  geom_point()
+
+
+churn500 %>% filter(Support.Calls >5) %>% count(Churn)
+
+```
+It also appears that Support.Calls indicates churn - more than 6 means they churn.  These rows can be removed.
+
+```{r}
+churn6 <- churn500 %>%
+  filter(Support.Calls <= 5)
+```
+
+### Payment.Delay
+```{r}
+churn6 %>%
+  sample_n(10000) %>% # take a sample of the data for faster processing
+  ggplot(aes(Tenure, Payment.Delay, color = Churn)) +
+  geom_point()
+
+churn6 %>% filter(Payment.Delay >20) %>% count(Churn)
+```
+
+It also appears that Payment.Delay indicates churn - more than 20 means they churn.  These rows can be removed.
+
+```{r}
+churn20 <- churn6 %>%
+  filter(Payment.Delay <= 20)
+```
+
+
+### Contract.Length
+```{r}
+churn20 %>%
+  sample_n(10000) %>% # take a sample of the data for faster processing
+  ggplot(aes(Tenure, Contract.Length, color = Churn)) +
+  geom_point()
+
+churn20 %>% filter(Contract.Length == "Monthly") %>% count(Churn)
+```
+
+It also appears that Contract.Length indicates churn - if it's monthly, they Churn.  These rows can be removed.
+
+```{r}
+churn_m <- churn20 %>%
+  filter(Contract.Length != "Monthly")
+```
+
+## Training Data
+Unfortunately this does not have the same cutoffs as the train data, so I will combine and resplit
+```{r}
+churn_test %>% filter(Age >50) %>% count(Churn)
+churn_test %>% filter(Total.Spend <500) %>% count(Churn)
+churn_test %>% filter(Support.Calls >5) %>% count(Churn)
+churn_test %>% filter(Payment.Delay >20) %>% count(Churn)
+churn_test %>% filter(Contract.Length == "Monthly") %>% count(Churn)
+```
+```{r}
+df <- rbind(churn, churn_test) %>% na.omit(.)
+```
+
+```{r}
+summary(df)
+df %>%
+  filter_all(any_vars(is.na(.)))
+```
+
+
+```{r}
+df %>%
+  ggplot(aes(Support.Calls, color = as.factor(Churn))) +
+  geom_histogram()
+
+df %>% filter(Support.Calls >=10) %>% count(Churn)
+
+df %>%
+  ggplot(aes(Payment.Delay, color = as.factor(Churn))) +
+  geom_histogram()
+
+df %>% filter(Payment.Delay >=30) %>% count(Churn)
+
+
+df %>%
+  ggplot(aes(Total.Spend, color = as.factor(Churn))) +
+  geom_histogram()
+
+df %>% filter(Total.Spend <= 100) %>% count(Churn)
+
+
+```
+
+```{r}
+df %>%
+  ggplot(aes(Contract.Length,Age,  color = as.factor(Churn))) +
+  geom_boxplot()
+```
+
+
+
+# Modeling
+```{r}
+set.seed(123)
+churn_split <- initial_split(df, strata = Churn)
+churn_train <- training(churn_split)
+churn_test <- testing(churn_split)
+```
+
+Double Check some of the fields from the initial dataset.  Looks good
+```{r}
+churn_train %>% filter(Age >50) %>% count(Churn)
+churn_test %>% filter(Age >50) %>% count(Churn)
+churn_train %>% filter(Total.Spend <500) %>% count(Churn)
+churn_test %>% filter(Total.Spend <500) %>% count(Churn)
+```
+
+```{r}
+glm_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+rf_spec <- rand_forest() %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+```
+
+```{r}
+churn_wf <- workflow() %>%
+  add_formula(churn ~ .)
+
+```
+
+```{r}
+churn_wf %>%
+  add_model(glm_spec) %>%
+  fit(data = churn_train)
+
+```
+
