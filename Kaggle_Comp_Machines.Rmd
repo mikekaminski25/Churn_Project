@@ -1,0 +1,395 @@
+---
+title: "Kaggle Churn"
+author: "Mike Kaminski"
+date: "2023-07-12"
+output: html_document
+---
+# Setup and Packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, warning = FALSE,
+                      message = FALSE, dpi = 180,
+                      fig.width = 10, fig.height = 5)
+```
+
+```{r}
+library(tidymodels) # broom, dials, dplyr, ggplot2, parsnip, purrr, recipes, tibble, tune, workflow, yardstick
+library(tidyverse) # ggplot2, dplyr, tidyr, readr, purrr,tibble, stringr, forcats, lubridate
+library(corrplot)
+library(themis) # needed for undersampling
+
+```
+
+## Kaggle Link for data
+# https://www.kaggle.com/competitions/playground-series-s3e17
+```{r}
+raw_train <- read_csv("train.csv")
+raw_test <- read_csv("test.csv")
+```
+
+Rename the columns and make factors
+```{r}
+train <- raw_train
+test <- raw_test
+
+colnames(train) <- c('id','prod_id','type', 'air_temp', 'proc_temp', 'rpms', 'torq', 'wear','fail', 'twf','hdf','pwf','osf','rnf')
+colnames(test) <- c('id','prod_id','type', 'air_temp', 'proc_temp', 'rpms', 'torq', 'wear', 'twf','hdf','pwf','osf','rnf')
+
+train <- train %>%
+  mutate_at(vars(type, twf, hdf, pwf, osf,rnf,fail), factor)
+
+test <- test %>%
+  mutate_at(vars(type, twf, hdf, pwf, osf,rnf), factor)
+
+```
+
+# Explore the data
+```{r}
+train %>% select(-id,-prod_id) %>% summary()
+test %>% select(-id,-prod_id) %>% summary()
+
+#check for NAs
+train %>%
+  summarize(across(everything(),
+            ~sum(is.na(.x))))
+test %>%
+  summarize(across(everything(),
+            ~sum(is.na(.x))))
+```
+## Correlation
+```{r}
+numeric_vars <- train[, sapply(train, is.numeric)] %>% select(-id)
+m <- cor(numeric_vars)
+corrplot(m, col = COL1('OrRd', 10),addCoef.col = 'black')
+```
+air_temp and proc_temp  and torq and rpms are the only variables that have a strong correlation. wear isn't correlated with anything.
+
+Plots
+```{r}
+
+train %>%
+  # sample_n(25000) %>% 
+  ggplot(aes(air_temp, proc_temp, color = fail)) +
+  geom_point() +
+  facet_wrap(~fail)
+
+# table(train$failure, train$twf)
+
+```
+Box Plots
+```{r}
+box_func <- function(col){
+  plt <- train %>%
+    ggplot(aes(x = {{col}}, y = type, color = fail)) +
+    geom_boxplot()
+  plt
+}
+```
+
+```{r}
+box_func(air_temp) #+ labs(title = paste0("Boxplot of air_temp by type for failures"))
+box_func(proc_temp)
+box_func(rpms)
+box_func(torq)
+box_func(wear)
+
+```
+Failures have a higher median air temp, occur at a lower rpm, and have a higher torq rate.  Proc temp and wear are more similar for failure vs not failure.
+
+```{r}
+table(train$fail, train$twf)
+table(train$fail, train$hdf)
+table(train$fail, train$pwf)
+table(train$fail, train$osf)
+table(train$fail, train$rnf)
+```
+Generally, the failures occur when twf, hdf, pwf, and osf are true.  An rnf generally occurs when a failure does not occur.  It's possible that these are failure codes some how - hdf could be hydraulic failure, pwf could be power failure, osf could be operating system failure.  I'm not sure what twf and rnf could be.
+
+
+```{r}
+a <- train %>%
+  filter(fail == 1) %>%
+  mutate(across(c(twf, hdf, pwf, osf, rnf), as.numeric)-1) %>%
+  mutate(row_sum = rowSums(select(., twf, hdf, pwf, osf, rnf), na.rm = TRUE)) %>%
+  select(9:15) %>%
+  arrange(row_sum) %>%
+  group_by(row_sum) %>%
+  summarise(sum = n())
+a  
+
+
+```
+Of all the failures, 507 didn't have a value in the 5 xxf variables, 1512 had 1 value in an xxf variable, 123 had 2, 6 had 3.  So a failure doesn't necessary mean that one of the 5 xxf variables will also occur, but about 75% of time at least one of these variables will also occur.
+
+## Building some tidymodels to predict machine failure
+
+The main packages in the `tidymodels` suite that we will use:
+
+`rsample`: train/test or cross validation splits
+`recipes`: pre-processing of data
+`parsnip`: specifying the model we want to use
+`workflows` : for putting the model together and constructing the workflow
+`yardstick`: model evaluation metrics
+`broom` : for model outputs in a clean/tidy data frame
+
+* Setting the recipe is just specifying the model.
+* Key note here is that there are a number of helper functions (e.g., `step_normalize()`, `step_impute_median()`, `step_dummy()`) that can be useful for handling data preparation. 
+
+Since the test data doesn't have the actual values, I'll create a validation set and test/tune on that
+```{r}
+set.seed(525)
+validation <- initial_split(train, prop = 3/4, strata = fail)
+val_train <- training(validation)
+val_test <- testing(validation)
+
+# I'll eventually want to use cross validation
+set.seed(636)
+folds <- vfold_cv(val_train, v = 5, strata = "fail")
+```
+
+
+### Down Sampling
+```{r}
+i <- val_train$fail
+j <- val_test$fail
+proportions <- matrix(c(prop.table(table(i)), prop.table(table(j))), nrow = 2, ncol = 2)
+rownames(proportions) <- c("0", "1")
+colnames(proportions) <- c("train", "test")
+proportions
+
+```
+Both datasets contain about 1.5% failures, which is good, however the data set is incredibly imbalanced, so I will try a few different ways to account for this.
+
+### Create a recipe
+The themis package contains a function that allows for down/up sampling
+I'll create a recipe for the entire datas et and for the downsampled data set.
+```{r}
+# recipe for unsampled data set
+fail_rec <-
+  recipe(fail ~., data = val_train) %>%
+  update_role(id, prod_id, new_role = "ID") %>%
+  step_dummy(all_nominal_predictors())
+
+# fail_rec %>% summary()
+
+# recipe for downsampling
+fail_rec_ds <- fail_rec %>%
+  step_downsample(fail, under_ratio = 1)
+
+# fail_rec_us %>% summary()
+```
+
+### Fit a model with a recipe
+The recipe is used across several steps to train the model
+* Process the recipe using the training set and/or downsampled training set.
+** The recipe updates the role of id and prod_id so that they're excluded and converts variables to dummy variables
+* The recipe is applied to the training set
+* And the recipe is applied to the test set
+```{r}
+# logistic regression specification
+glm_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+# # random forest specification
+# rf_spec <- rand_forest() %>%
+#   set_mode("classification") %>%
+#   set_engine("ranger")
+
+```
+The random forest model can learn interactions, so that could be helpful.
+
+### Create a workflow
+* This is a way to put pieces of a model together - it pairs the model and the recipe.
+* different recipes need different models, so when a model and recipe are bundled, it becomes easier to train and test workflows.
+```{r}
+fail_wf <- 
+  workflow() %>%
+  add_model(glm_spec) %>%
+  add_recipe(fail_rec)
+```
+
+### Prepare the recipe and train the model from the predictors
+```{r}
+fail_fit <-
+  fail_wf %>%
+  fit(data = val_train)
+
+```
+
+The helper function extract_fit_parsnip extracts the model from the workflow and the tidy function in broom tidies the coefficients - among other metrics
+```{r}
+fail_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  mutate(across(2:5, round, 4))
+```
+
+### Predict on the Test data
+```{r}
+head(predict(fail_fit, val_test),10) # this gives us zeros and ones
+
+fail_aug <-
+  augment(fail_fit, val_test) # this will give us other variables - .pred_class, ,pred_0, ,pred_1 and puts the data into a tibble
+
+fail_aug %>%
+  select(fail, .pred_class, .pred_0, .pred_1) %>%
+  mutate(across(3:4, round, 4))
+
+```
+
+So now we evaluate
+```{r}
+fail_aug %>%
+  roc_curve(truth = fail, .pred_0) %>%
+  autoplot()
+
+fail_aug %>%
+  roc_auc(truth = fail, .pred_0)
+```
+That actually performed fairly well - even without downsampling.  I'll try with downsampling to see if we can improve.
+Here's the recipe from before
+* fail_rec_ds <- fail_rec %>% step_downsample(fail, under_ratio = 1)
+
+The fail workflow is the same - jsut with a new recipe
+```{r}
+fail_wf_ds <- 
+  workflow() %>%
+  add_model(glm_spec) %>%
+  add_recipe(fail_rec_ds)
+```
+
+The fit is essentially the same as well, just adding in the new workflow
+```{r}
+fail_fit_ds <-
+  fail_wf_ds %>%
+  fit(data = val_train)
+```
+
+```{r}
+fail_fit_ds %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  mutate(across(2:5, round, 4))
+```
+```{r}
+head(predict(fail_fit_ds, val_test),10) # this gives us zeros and ones
+
+fail_aug_ds <-
+  augment(fail_fit_ds, val_test) # this will give us other variables - .pred_class, ,pred_0, ,pred_1 and puts the data into a tibble
+
+fail_aug_ds %>%
+  select(fail, .pred_class, .pred_0, .pred_1) %>%
+  mutate(across(3:4, round, 4))
+```
+
+So now we evaluate
+```{r}
+fail_aug_ds %>%
+  roc_curve(truth = fail, .pred_0) %>%
+  autoplot()
+
+fail_aug_ds %>%
+  roc_auc(truth = fail, .pred_0)
+
+fail_aug %>%
+  roc_auc(truth = fail, .pred_0)
+```
+Downsampled gave a 0.93438 accuracy
+Nondownsampled gave a 0.93477 accuracy
+
+Downsampling actually hurt the accuracy.
+
+## Apply the model from the validation set to the test set and submit to Kaggle
+```{r}
+
+```
+
+
+### End
+
+
+
+
+
+
+
+
+
+Fit a model with a recipe
+```{r}
+lr_mod <- 
+  logistic_reg() %>% 
+  set_engine("glm")
+```
+
+create a workflow to combine4
+```{r}
+fail_wflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(fail_rec)
+```
+
+```{r}
+fail_fit <- 
+  fail_wflow %>% 
+  fit(data = train)
+```
+
+```{r}
+fail_fit %>% 
+  extract_fit_parsnip() %>% 
+  tidy() %>%
+  mutate(across(2:5, round, 4))
+
+```
+
+The coefficients are fairly large compared to the others when twf, hdf, pwf, and osf equal 1.  It makes me feel that this is some type of failure code.  rnf has a small negative coefficient, which may disprove that point.
+
+folds <- vfold_cv(val_train, v = 5, strata = "fail")
+
+Predict
+```{r}
+predict(fail_fit, test)
+
+fail_aug <- augment(fail_fit, test)
+fail_aug %>% 
+  select()
+```
+
+```{r}
+train1 <- train %>%
+  mutate(bootstraps = as.factor(paste0(failure, twf,hdf,pwf,osf,rnf)))
+  
+```
+
+
+```{r}
+machine_boot <- bootstraps(train1,times = 10, strata = bootstraps)
+machine_boot$splits
+```
+
+```{r}
+glm_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+rf_spec <- rand_forest() %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+```
+
+```{r}
+machine_workflow <- workflow() %>%
+  add_formula(failure ~ .)
+  
+```
+
+```{r}
+glm_rs <- machine_workflow %>%
+  add_model(glm_spec) %>%
+  fit_resamples(
+    resamples = machine_boot,
+    control = control_resamples(save_pred = TRUE, verbose = TRUE)  
+  )
+
+```
+
