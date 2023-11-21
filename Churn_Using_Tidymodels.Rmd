@@ -1,0 +1,354 @@
+---
+title: "Churn Example Models"
+author: "Mike Kaminski"
+date: "2023-11-20"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries and Load Data
+```{r libraries}
+library(tidymodels)
+tidymodels_prefer()
+```
+
+```{r data_load}
+data <- read.csv("C:/Users/mikek/Downloads/WA_Fn-UseC_-Telco-Customer-Churn.csv")
+```
+
+# Initial Data Review
+```{r}
+summary(data)
+```
+  * Many of the columns have character values, but they should really be factors
+  * customerID isn't needed for modeling purposes, but it's worth including in the data frame for now in case research needs to done after modeling is complete
+  * SeniorCitizens is numeric, but it should be a character/factor
+  * Total Charges appears to be the product of MonthlyCharges and Tenure
+
+## Update the data
+- Updated various values in various cells and fixed NAs
+```{r}
+df_churn <- data |>
+  
+  # update SeniorCitizen to a character value
+  mutate(SeniorCitizen = ifelse(SeniorCitizen == 0, "No","Yes")) |>
+  
+  # replace NAs in TotalCharges with 0.  When filtering the NAs, all these customers had a tenure of 0, meaning they haven't paid anything...yet
+  mutate(TotalCharges = ifelse(is.na(TotalCharges),0,TotalCharges)) |>
+  
+  # I also want to create variables for Phone Only, Internet Only, or Both
+  mutate(Package = ifelse(PhoneService %in% 'Yes' & InternetService %in% 'No', 'PhoneOnly',
+                          ifelse(InternetService %in% c('DSL','Fiber Optic') & PhoneService %in% 'No', 'InternetOnly','Both'))
+         ) |>
+
+  # Put Churn at the front
+  select(Churn,everything())
+```
+  
+```{r}
+# Now I'd like to see which features are most correlated with Churn
+
+# this code creats a matrix by expanding factor variables to a set of dummy variables
+churn_corr <- as.data.frame(model.matrix(~., data = df_churn |> select(-customerID))) |> select(-1)
+
+m <- cor(churn_corr)
+
+m_churn <- m['ChurnYes', ]
+
+m_churn_df <- data.frame(variable = names(m_churn), correlation = m_churn)
+
+m_churn_df |> 
+  filter(variable != 'ChurnYes') |>
+  ggplot(aes(x = reorder(variable,-correlation), y = correlation, fill = correlation)) +
+  geom_bar(stat = "identity", position = "identity", fill = 'steelblue') +
+  geom_text(aes(label = sprintf("%.3f", correlation)), vjust = -0.5) +
+  labs(title = 'Correlation with Churn', y = 'Correlation',x = 'Variable') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 10)) +
+  scale_y_continuous(limits = c(-0.4, 0.4), breaks = seq(-0.4, 0.4, by = 0.1))
+
+```
+From this bar plot, we can see that Fiber Optic Internet customers and customer who pay by electronic check have a positive correlation with Churn, while customers with a longer tenure and customers with a contract of two-years have a negative correlation with Churn
+
+```{r include = FALSE}
+# testing data
+df_churn |> summary()
+
+df_churn |> 
+  mutate_at(vars('OnlineSecurity','OnlineBackup','DeviceProtection','TechSupport','StreamingTV','StreamingMovies'), ~ifelse(. == "No internet service","No",.) ) |>   mutate_if(is.character, as.factor) |> 
+  mutate(TotalCharges = ifelse(is.na(TotalCharges),0,TotalCharges)) |>
+  summary()
+```
+### Correlation
+This provides pairwise correlations for each factor value.  There are values of 1 and -1, which is too be expected given how the data is structured - Churn Yes and Churn No are obviously going to have a -1 correlation.
+```{r}
+test <- df_churn |> mutate_if(is.character, as.factor) |> select_if(is.factor) |> select(-customerID)
+
+library(ggcorrplot)
+model.matrix(~0+., data=test) %>% 
+  cor(use="pairwise.complete.obs") %>% 
+  ggcorrplot(show.diag=FALSE, type="lower", lab=TRUE, lab_size=2,tl.cex =8)
+
+```
+
+# Modeling
+
+There are a few different models I want to look at for predicting Churn
+  * Logistic Regression
+  * Random Forest
+  * xgBoost
+  * KNN
+  * SVM
+
+I'll explore splitting the data using a strata split based on Churn - given that it's slightly imbalance - and cross-validation - which rarely hurts and often helps.
+```{r}
+model_df <- df_churn |> mutate_if(is.character, as.factor) |> mutate(customerID = as.character(customerID))
+# changing to factors
+```
+
+## Setting up the split and crossvalidation  
+```{r}
+set.seed(21425)
+churn_split <- initial_split(model_df, strata = Churn)
+churn_train <- training(churn_split)
+churn_test <- testing(churn_split)
+
+# I'll set up crossfold validation for use later if the results aren't great
+set.seed(1502)
+churn_folds <- 
+   vfold_cv(churn_train, strata = Churn)
+```
+
+## Recipe
+```{r}
+lr_rec <- 
+  recipe(Churn ~ ., churn_train) |>
+  
+  # keeps the custID in case we have to explore a specific customer
+  update_role(customerID, new_role = "ID") |> # keeps the custID in case we have to explore a specific customer
+  
+  # creates dummy variables
+  step_dummy(all_nominal_predictors()) |> # this will exclude the outcome varible ()
+  
+  # removes variables with zero variance, if any
+  step_zv(all_predictors()) |>
+  
+  # Normalize the data for regularization
+  step_normalize(all_numeric_predictors())
+
+# lr_rec$term_info
+
+```
+
+### Prep
+Prep for a recipe is like fit for a model.  It goes through and performs the steps in the recipe
+```{r}
+churn_prep <- prep(lr_rec) #|> tidy(number = 2)
+churn_prep$var_info
+
+```
+
+
+## Build the Model
+I'll start with a regularization logistic regression model, tuning the penalty and mixture.  A mixture of 1 is a pure lasso model and 0 is a pure ridge.  The penalty is the lambda value - a higher value represents stronger regularization - which generally leads to smaller coefficients.
+```{r}
+lr_mod <- 
+  logistic_reg(
+    penalty = tune(), # range from -10, 0 - represents the amount of the penalty
+    mixture = tune() # range from 0,1 represents the relative amount of penalties
+    ) %>% 
+  set_engine("glmnet")
+lr_mod
+```
+## Create the workflow
+```{r}
+lr_workflow <- 
+  workflow() |> 
+  add_model(lr_mod) |>
+  add_recipe(lr_rec)
+```
+
+## Create a grid for tuning
+Levels of 5 indicate that a 5x5 maxtrix will be created
+```{r}
+lr_grid <- grid_regular(penalty(),
+                          mixture(),
+                          levels = 5)
+```
+
+```{r}
+options(scipen = 999)
+lr_grid %>% 
+  count(penalty)
+```
+
+## Model Tuning with a grid
+churn_folds was created earlier in the code churn_folds <- vfold_cv(churn_train, strata = Churn)
+```{r}
+set.seed(345)
+
+lr_wf <- workflow() %>%
+  add_model(lr_mod) %>%
+  add_recipe(lr_rec)
+
+lr_res <- 
+  lr_wf %>% 
+  tune_grid(
+    resamples = churn_folds,
+    control = control_grid(save_pred = TRUE),
+    grid = lr_grid
+    )
+
+lr_res$splits[[1]]
+```
+
+```{r}
+lr_res |>
+  collect_metrics() |>
+  filter(.metric == 'roc_auc') |>
+  arrange(-mean,penalty,mixture)
+```
+
+```{r}
+lr_res %>%
+  collect_metrics() %>%
+  mutate(mixture = factor(mixture)) %>%
+  ggplot(aes(penalty, mean, color = mixture)) +
+  geom_line(linewidth = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+```{r}
+lr_res %>%
+  show_best("accuracy")
+
+lr_res %>%
+  show_best("roc_auc")
+```
+
+```{r}
+rf_rec <- lr_rec
+
+rf_mod <-
+   rand_forest(mtry = tune(), 
+               min_n = tune(), 
+               trees = 1000
+               ) %>% 
+   set_engine("ranger") %>% 
+   set_mode("classification")
+```
+
+## Create the workflow
+```{r}
+rf_workflow <- 
+  workflow() |> 
+  add_model(rf_mod) |>
+  add_recipe(rf_rec)
+```
+
+## Train Hyperparameters
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(345)
+rf_tune <- tune_grid(
+  rf_workflow,
+  resamples = churn_folds,
+  grid = 20
+)
+
+rf_tune
+```
+
+```{r}
+rf_tune |> collect_metrics() 
+rf_tune |> select_best()
+```
+
+```{r}
+rf_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+
+```{r}
+rf_grid <- grid_regular(
+  mtry(range = c(0, 7)),
+  min_n(range = c(25, 40)),
+  levels = 5
+)
+
+rf_grid
+```
+
+```{r}
+set.seed(456)
+rf_tune_reg <- tune_grid(
+  rf_workflow,
+  resamples = churn_folds,
+  grid = rf_grid
+)
+
+rf_tune_reg
+```
+
+```{r}
+rf_tune_reg %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean, color = min_n)) +
+  geom_line(alpha = 0.5, size = 1.5) +
+  geom_point() +
+  labs(y = "AUC")
+```
+
+```{r}
+best_auc <- select_best(rf_tune_reg, "roc_auc")
+
+final_rf <- finalize_model(
+  rf_mod,
+  best_auc
+)
+
+final_rf
+```
+```{r}
+library(vip)
+
+final_rf %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(Churn ~ .,
+    data = juice(churn_prep) %>% select(-customerID)
+  ) %>%
+  vip(geom = "point")
+```
+
+```{r}
+final_wf <- workflow() %>%
+  add_recipe(rf_rec) %>%
+  add_model(final_rf)
+
+final_res <- final_wf %>%
+  last_fit(churn_split)
+
+final_res %>%
+  collect_metrics()
+```
+
