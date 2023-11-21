@@ -50,6 +50,17 @@ df_churn <- data |>
 ```
   
 ```{r}
+test <-  df_churn |>
+  mutate(across(where(is.character), as.factor))|>
+  select(-customerID)
+
+as.data.frame(model.matrix(~0+ ., data = test) |> cor(use="pairwise.complete.obs"))
+
+```
+  
+  
+  
+```{r}
 # Now I'd like to see which features are most correlated with Churn
 
 # this code creats a matrix by expanding factor variables to a set of dummy variables
@@ -63,7 +74,7 @@ m_churn_df <- data.frame(variable = names(m_churn), correlation = m_churn)
 
 m_churn_df |> 
   filter(variable != 'ChurnYes') |>
-  ggplot(aes(x = reorder(variable,-correlation), y = correlation, fill = correlation)) +
+  ggplot(aes(x = reorder(variable,-correlation), y = correlation)) +
   geom_bar(stat = "identity", position = "identity", fill = 'steelblue') +
   geom_text(aes(label = sprintf("%.3f", correlation)), vjust = -0.5) +
   labs(title = 'Correlation with Churn', y = 'Correlation',x = 'Variable') +
@@ -74,27 +85,77 @@ m_churn_df |>
 ```
 From this bar plot, we can see that Fiber Optic Internet customers and customer who pay by electronic check have a positive correlation with Churn, while customers with a longer tenure and customers with a contract of two-years have a negative correlation with Churn
 
-```{r include = FALSE}
-# testing data
-df_churn |> summary()
-
-df_churn |> 
-  mutate_at(vars('OnlineSecurity','OnlineBackup','DeviceProtection','TechSupport','StreamingTV','StreamingMovies'), ~ifelse(. == "No internet service","No",.) ) |>   mutate_if(is.character, as.factor) |> 
-  mutate(TotalCharges = ifelse(is.na(TotalCharges),0,TotalCharges)) |>
-  summary()
-```
-### Correlation
-This provides pairwise correlations for each factor value.  There are values of 1 and -1, which is too be expected given how the data is structured - Churn Yes and Churn No are obviously going to have a -1 correlation.
 ```{r}
-test <- df_churn |> mutate_if(is.character, as.factor) |> select_if(is.factor) |> select(-customerID)
+# Fiber Optic internet is easily the most common
+df_churn %>%
+    ggplot(aes(x = InternetService, fill = InternetService)) +
+    geom_bar() +
+    theme(legend.position="none") +
+    labs(x ="") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 
-library(ggcorrplot)
-model.matrix(~0+., data=test) %>% 
-  cor(use="pairwise.complete.obs") %>% 
-  ggcorrplot(show.diag=FALSE, type="lower", lab=TRUE, lab_size=2,tl.cex =8)
+# Electronic Check is the most common payment method
+df_churn %>%
+    ggplot(aes(x = PaymentMethod, fill = PaymentMethod)) +
+    geom_bar() +
+    theme(legend.position="none") +
+    labs(x ="") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 
+# Fiber Optic by Electronic Check is by far the most common
+df_churn %>%
+    ggplot(aes(x = PaymentMethod, fill = PaymentMethod)) +
+    geom_bar() +
+    facet_wrap(vars(InternetService)) +
+    theme(legend.position="none") +
+    labs(x ="") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+# much of the churn appears to come from Fiber Optic customer who pay by electronic check. Might be worth exploring
+    ggplot(aes(x = PaymentMethod, fill = PaymentMethod)) +
+    geom_bar() +
+    facet_wrap(vars(Churn, InternetService)) +
+    theme(legend.position="none") +
+    labs(x ="") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 ```
 
+```{r}
+# There are a lot of shorter tenures
+df_churn %>%
+    ggplot(aes(x = tenure)) +
+    geom_bar(color = "blue") +
+    theme(legend.position="none") +
+    labs(x ="") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+# Month-to-month is the most common contract
+df_churn %>%
+    ggplot(aes(x = Contract, fill = Contract)) +
+    geom_bar() +
+    theme(legend.position="none") +
+    labs(x ="") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+# Month-to-month have shorter tenures, two year contracts have longer tenures
+df_churn %>%
+    ggplot(aes(x = tenure)) +
+    geom_bar(color = "blue") +
+    facet_wrap(vars(Contract)) +
+    theme(legend.position="none") +
+    labs(x ="") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+# much of the churn appears to come from month to month clients with a shorter tenure
+df_churn %>%
+    ggplot(aes(x = tenure)) +
+    geom_bar(color = "blue") +
+    facet_wrap(vars(Churn, Contract)) +
+    theme(legend.position="none") +
+    labs(x ="") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+```
 # Modeling
 
 There are a few different models I want to look at for predicting Churn
@@ -125,14 +186,14 @@ churn_folds <-
 
 ## Recipe
 ```{r}
-lr_rec <- 
+model_recipe <- 
   recipe(Churn ~ ., churn_train) |>
   
   # keeps the custID in case we have to explore a specific customer
   update_role(customerID, new_role = "ID") |> # keeps the custID in case we have to explore a specific customer
   
   # creates dummy variables
-  step_dummy(all_nominal_predictors()) |> # this will exclude the outcome varible ()
+  step_dummy(all_nominal_predictors()) |> # this will exclude the outcome variable ()
   
   # removes variables with zero variance, if any
   step_zv(all_predictors()) |>
@@ -140,120 +201,171 @@ lr_rec <-
   # Normalize the data for regularization
   step_normalize(all_numeric_predictors())
 
-# lr_rec$term_info
-
-```
-
-### Prep
-Prep for a recipe is like fit for a model.  It goes through and performs the steps in the recipe
-```{r}
-churn_prep <- prep(lr_rec) #|> tidy(number = 2)
-churn_prep$var_info
-
 ```
 
 
-## Build the Model
-I'll start with a regularization logistic regression model, tuning the penalty and mixture.  A mixture of 1 is a pure lasso model and 0 is a pure ridge.  The penalty is the lambda value - a higher value represents stronger regularization - which generally leads to smaller coefficients.
+## Building Model Specifications
+I want to use glmnet for penalized logistic regression, random forest, xgBoost, K-nearest neighbor, and support vector machines for my models
+For all of these models - except for glmnet - I need to specify the mode - classification
 ```{r}
-lr_mod <- 
-  logistic_reg(
-    penalty = tune(), # range from -10, 0 - represents the amount of the penalty
-    mixture = tune() # range from 0,1 represents the relative amount of penalties
-    ) %>% 
+glm_spec <-
+  logistic_reg(penalty = tune(), # range from -10, 0 - represents the amount of the penalty
+               mixture = tune() # range from 0,1 represents the relative amount of penalties
+                        ) %>% 
   set_engine("glmnet")
-lr_mod
-```
-## Create the workflow
-```{r}
-lr_workflow <- 
-  workflow() |> 
-  add_model(lr_mod) |>
-  add_recipe(lr_rec)
-```
 
-## Create a grid for tuning
-Levels of 5 indicate that a 5x5 maxtrix will be created
-```{r}
-lr_grid <- grid_regular(penalty(),
-                          mixture(),
-                          levels = 5)
-```
-
-```{r}
-options(scipen = 999)
-lr_grid %>% 
-  count(penalty)
-```
-
-## Model Tuning with a grid
-churn_folds was created earlier in the code churn_folds <- vfold_cv(churn_train, strata = Churn)
-```{r}
-set.seed(345)
-
-lr_wf <- workflow() %>%
-  add_model(lr_mod) %>%
-  add_recipe(lr_rec)
-
-lr_res <- 
-  lr_wf %>% 
-  tune_grid(
-    resamples = churn_folds,
-    control = control_grid(save_pred = TRUE),
-    grid = lr_grid
-    )
-
-lr_res$splits[[1]]
-```
-
-```{r}
-lr_res |>
-  collect_metrics() |>
-  filter(.metric == 'roc_auc') |>
-  arrange(-mean,penalty,mixture)
-```
-
-```{r}
-lr_res %>%
-  collect_metrics() %>%
-  mutate(mixture = factor(mixture)) %>%
-  ggplot(aes(penalty, mean, color = mixture)) +
-  geom_line(linewidth = 1.5, alpha = 0.6) +
-  geom_point(size = 2) +
-  facet_wrap(~ .metric, scales = "free", nrow = 2) +
-  scale_x_log10(labels = scales::label_number()) +
-  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
-```
-
-```{r}
-lr_res %>%
-  show_best("accuracy")
-
-lr_res %>%
-  show_best("roc_auc")
-```
-
-```{r}
-rf_rec <- lr_rec
-
-rf_mod <-
+rf_spec <- 
    rand_forest(mtry = tune(), 
                min_n = tune(), 
                trees = 1000
                ) %>% 
    set_engine("ranger") %>% 
    set_mode("classification")
+
+xgb_spec <- 
+   boost_tree(tree_depth = tune(), 
+              learn_rate = tune(), 
+              loss_reduction = tune(), 
+              min_n = tune(), 
+              sample_size = tune(), 
+              trees = tune()) %>% 
+   set_engine("xgboost") %>% 
+   set_mode("classification")
+
+knn_spec <- 
+   nearest_neighbor(neighbors = tune(), 
+                    dist_power = tune(), 
+                    weight_func = tune()) %>% 
+   set_engine("kknn") %>% 
+   set_mode("classification")
+
+svm_spec <- 
+   svm_rbf(cost = tune(), 
+           rbf_sigma = tune()) %>% 
+   set_engine("kernlab") %>% 
+   set_mode("classification")
+
 ```
 
-## Create the workflow
+
+## Create a workflow
+I can create a workflow set that runs all these at once, but I think it would be useful to do at least one to see how the process flows
+```{r}
+glmnet_wf <- 
+  workflow() |> 
+  add_model(glm_spec) |>
+  add_recipe(model_recipe)
+```
+
+### For glmnet, I want to create a grid for tuning and then apply to the model
+Levels of 5 indicate that a 5x5 matrix will be created
+```{r}
+glmnet_grid <- grid_regular(penalty(range()),
+                          mixture(),
+                          levels = 5)
+
+```
+
+```{r}
+set.seed(345)
+
+glmnet_res <- 
+  glmnet_wf %>% 
+  tune_grid(
+    resamples = churn_folds,
+    control = control_grid(save_pred = TRUE),
+    grid = glmnet_grid
+    )
+
+# lr_res$splits[[1]]
+```
+
+```{r}
+glmnet_res |>
+  collect_metrics() |>
+  filter(.metric == "roc_auc") |>
+  arrange(-mean,penalty, mixture)
+```
+
+```{r}
+glmnet_res %>%
+  collect_metrics() %>%
+  mutate(mixture = factor(mixture)) %>%
+  ggplot(aes(penalty, mean, color = mixture)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+Lower penalties seem to do well, however mixture isn't quite as clear - they're all around 83-84%.  I can re-tune with a small penalty range
+```{r}
+glmnet_grid <- grid_regular(penalty(range = c(-10,-5)), # range is -10 to 0 and on the log scale
+                          mixture(),
+                          levels = 5)
+
+set.seed(345)
+
+glmnet_res <- 
+  glmnet_wf %>% 
+  tune_grid(
+    resamples = churn_folds,
+    control = control_grid(save_pred = TRUE),
+    grid = glmnet_grid
+    )
+
+glmnet_res |>
+  collect_metrics() |>
+  filter(.metric == "roc_auc") |>
+  arrange(-mean,penalty, mixture)
+
+```
+
+Not much of an improvement, but I can still use the newly tuned values
+```{r}
+best_glmnet <- glmnet_res %>%
+  select_best("roc_auc")
+best_glmnet
+```
+
+#### Final Model
+Creating a workflow using the best penalty and mixture - a low penalty and a pure lasso regularization
+```{r}
+final_wf <- 
+  glmnet_wf %>% 
+  finalize_workflow(best_glmnet)
+```
+
+Metrics and ROC curve
+* last_fit() emulates the process where, after determining the best model - aka from final_wf, the final fit on the entire training set is needed and is then evaluated on the test set.
+```{r warning=FALSE}
+final_fit <- 
+  final_wf %>%
+  last_fit(churn_split) 
+
+final_fit %>%
+  collect_metrics()
+
+final_fit %>%
+  collect_predictions() %>% 
+  roc_curve(Churn, .pred_No) %>% 
+  autoplot()
+```
+Best roc_auc is 85.8
+
+### Random Forest
+
+#### Create the workflow
 ```{r}
 rf_workflow <- 
   workflow() |> 
-  add_model(rf_mod) |>
-  add_recipe(rf_rec)
+  add_model(rf_spec) |>
+  add_recipe(model_recipe)
 ```
 
-## Train Hyperparameters
+#### Train Hyperparameters
+This will be trained a bit differently than the penalized logistic regression.  RF models tend to perform well without tuning, but it doesn't hurt to explore a bit.  I won't use grid regular as with glmnet, but the tuning process is more or less the same., just takes a lot longer
 ```{r}
 doParallel::registerDoParallel()
 
@@ -264,7 +376,7 @@ rf_tune <- tune_grid(
   grid = 20
 )
 
-rf_tune
+# rf_tune$.metrics
 ```
 
 ```{r}
@@ -286,30 +398,25 @@ rf_tune %>%
   facet_wrap(~parameter, scales = "free_x") +
   labs(x = NULL, y = "AUC")
 ```
+Generally it looks like higher min_n and lower mtry, so defining ranges for each and re-tuning
 
 ```{r}
 rf_grid <- grid_regular(
-  mtry(range = c(0, 7)),
-  min_n(range = c(25, 40)),
+  mtry(range = c(0, 11)),
+  min_n(range = c(30, 40)),
   levels = 5
 )
-
-rf_grid
 ```
 
 ```{r}
 set.seed(456)
-rf_tune_reg <- tune_grid(
+rf_tune <- tune_grid(
   rf_workflow,
   resamples = churn_folds,
   grid = rf_grid
 )
 
-rf_tune_reg
-```
-
-```{r}
-rf_tune_reg %>%
+rf_tune %>%
   collect_metrics() %>%
   filter(.metric == "roc_auc") %>%
   mutate(min_n = factor(min_n)) %>%
@@ -317,17 +424,19 @@ rf_tune_reg %>%
   geom_line(alpha = 0.5, size = 1.5) +
   geom_point() +
   labs(y = "AUC")
+
 ```
+An mtry of 5 and min_n of 40 
 
 ```{r}
-best_auc <- select_best(rf_tune_reg, "roc_auc")
+best_auc <- select_best(rf_tune, "roc_auc")
 
 final_rf <- finalize_model(
-  rf_mod,
+  rf_spec,
   best_auc
 )
-
 final_rf
+
 ```
 ```{r}
 library(vip)
@@ -335,14 +444,17 @@ library(vip)
 final_rf %>%
   set_engine("ranger", importance = "permutation") %>%
   fit(Churn ~ .,
-    data = juice(churn_prep) %>% select(-customerID)
+    data = juice(prep(model_recipe)) %>% select(-customerID)
   ) %>%
   vip(geom = "point")
 ```
+Tenure and TotalCharges are important, but they're definitely correlated - TotalCharges is the product of tenure and MonthlyCharges.  Fiber Optic is also important as well as Monthly Charges - which by itself is a good indicator
+
 
 ```{r}
-final_wf <- workflow() %>%
-  add_recipe(rf_rec) %>%
+final_wf <- 
+  workflow() %>%
+  add_recipe(model_recipe) %>%
   add_model(final_rf)
 
 final_res <- final_wf %>%
@@ -351,4 +463,4 @@ final_res <- final_wf %>%
 final_res %>%
   collect_metrics()
 ```
-
+ROC_AUC is 85.3, worse than regularized logistic (85.8)
