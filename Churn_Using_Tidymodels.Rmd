@@ -1,18 +1,48 @@
 ---
-title: "Churn Example Models"
+title: "Using Tidymodels to Predict Churn"
 author: "Mike Kaminski"
 date: "2023-11-20"
-output: html_document
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: united
+    highlight: tango
+    fig_caption: true
 ---
+
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
 ```
 
-#Libraries, Data, and Quick Review
+```{r include = FALSE, eval = FALSE}
+remove.packages("rsconnect") #Remove Installed Packages
+remotes::install_version("rsconnect", version = "0.8.29") #Installing a Specific Version of a Package
+```
+
+
+# Background
+This data is from an old Kaggle competition - https://www.kaggle.com/datasets/blastchar/telco-customer-churn
+
+The data set includes information about:
+
+  * Customers who left within the last month – the column is called Churn
+  * Services that each customer has signed up for – phone, multiple lines, internet, online security, online backup, device protection, tech support, and streaming TV and movies
+  * Customer account information – how long they’ve been a customer, contract, payment method, paperless billing, monthly charges, and total charges
+  * Demographic info about customers – gender, age range, and if they have partners and dependents
+
+I've recently started using tidymodels instead of caret, so I wanted to run through an example.
+
+# Libraries, Data, and Quick Review
 ```{r libraries, warning = FALSE}
-library(tidymodels) #broom, dials, dplyr, ggplot2, infer, parsnip, purrr, recipes, rsample, tibble, tune, workflows, yardstick
+library(tidymodels) 
+#broom, dials, dplyr, ggplot2, infer, parsnip, purrr, recipes, rsample, tibble, tune, workflows, yardstick
+
 tidymodels_prefer()
+library(knitr)
 ```
 
 ```{r data_load, include = FALSE}
@@ -20,17 +50,18 @@ data <- read.csv("C:/Users/mikek/Downloads/WA_Fn-UseC_-Telco-Customer-Churn.csv"
 ```
 
 Initial Data Review
-  * Many of the columns have character values, but they should really be factors
-  * customerID isn't needed for modeling purposes, but it's worth including in the data frame for now in case research needs to done after modeling is complete
-  * SeniorCitizens is numeric, but it should be a character/factor
-  * Total Charges appears to be the product of MonthlyCharges and Tenure
-```{r quick_summary}
+
+* Many of the columns have character values, but they should really be factors
+* customerID isn't needed for modeling purposes, but it's worth including in the data frame for now in case research needs to done after modeling is complete
+* SeniorCitizens is numeric, but it should be a character/factor
+* Total Charges appears to be the product of MonthlyCharges and Tenure
+```{r quick_summary, width = 10,cols.print= 8}
 summary(data)
 ```
 
 
-#Update the data
-```{r update_data}
+Update the data
+```{r update_data, width = 14}
 df_churn <- data |>
   
   # update SeniorCitizen to a character value
@@ -41,14 +72,12 @@ df_churn <- data |>
   
   # I also want to create variables for Phone Only, Internet Only, or Both
   mutate(Package = ifelse(PhoneService %in% 'Yes' & InternetService %in% 'No', 'PhoneOnly',
-                          ifelse(InternetService %in% c('DSL','Fiber Optic') & PhoneService %in% 'No', 'InternetOnly','Both'))
-         ) |>
-
+                          ifelse(InternetService %in% c('DSL','Fiber Optic') & PhoneService %in% 'No', 'InternetOnly','Both'))) |>
   # Put Churn at the front
   select(Churn,everything())
 ```
 
-#EDA and Correlation
+# EDA and Correlation
 This code utilizes a recipe to create a data frame for each of the factor variables.  Rather than creating dummy variables, setting one_hot = TRUE creates an indicator column for each option.  This is better because I want to see how each of the factors compares to the Churn variable.
 
 If I had used one_hot = FALSE, than the column for contract type would NOT show me month to month, one year, and two year,  it would just show 2 of the 3 options.
@@ -60,11 +89,11 @@ corr_obj <- df_churn |> select(-customerID) |>
 corr_prep <- prep(corr_obj)
 
 corr_df <- bake(corr_prep, new_data = df_churn)
-head(corr_df)
+
 ```
 
 Reviews the correlation between Churn and all the variables
-```{r correlation_factors, warning = FALSE}
+```{r correlation_factors, warning = FALSE,out.height = "\\textheight",  out.width = "\\textwidth"}
 # Creates a matrix by expanding factor variables to a set of 'dummy variables'
 churn_corr <- as.data.frame(model.matrix(~., data = corr_df)) |> select(-1)
 
@@ -75,16 +104,19 @@ m_churn <- m['Churn_Yes', ]
 m_churn_df <- data.frame(variable = names(m_churn), correlation = m_churn)
 
 m_churn_df |> 
-  filter(variable != 'Churn_Yes') |>
+  filter(variable != c('Churn_Yes','Churn_No')) |>
   ggplot(aes(x = reorder(variable,-correlation), y = correlation)) +
   geom_bar(stat = "identity", position = "identity", fill = 'steelblue') +
-  geom_text(aes(label = sprintf("%.3f", correlation)), vjust = -0.5) +
+  geom_text(aes(label = sprintf("%.2f", correlation)),size = 2, vjust = -0.5,
+            position = position_dodge(width = 0.8)) +
+
   labs(title = 'Correlation with Churn', y = 'Correlation',x = 'Variable') +
   theme_minimal() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 9)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 8)) +
   scale_y_continuous(limits = c(-0.4, 0.4), breaks = seq(-0.4, 0.4, by = 0.1))
 
 ```
+
 From this bar plot, we can see that month to month contracts, no online security, no tech support, and Fiber Optic internet have the strongest positive correlations and tenure and 2 year contract have the strongest negative correlations - meaning that they are positively correlated with not churning.
 
 ```{r plot_of_contract_and_online_security}
@@ -159,8 +191,10 @@ df_churn %>%
     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 
 ```
-#Modeling
+
+# Model Setup
 There are a few different models I want to look at for predicting Churn:
+
   * Penalized Logistic Regression
   * Random Forest
   * XGBoost
@@ -173,7 +207,7 @@ I'll split the data on the Churn variable and use 10 fold cross-validation for t
 model_df <- df_churn |> mutate_if(is.character, as.factor) |> mutate(customerID = as.character(customerID))
 ```
 
-##Splitting and Cross-validation
+## Splitting and Cross-Validation
 ```{r model_setup}
 set.seed(21425)
 churn_split <- initial_split(model_df, strata = Churn)
@@ -185,7 +219,7 @@ churn_folds <-
    vfold_cv(churn_train, strata = Churn)
 ```
 
-##Recipes
+## Recipes
 The models that use distance functions will need to be normalized, so I'll create two different recipes
 ```{r recipes}
 model_recipe_no_norm <- 
@@ -207,8 +241,9 @@ model_recipe_norm <- model_recipe_no_norm |>
   
 ```
 
-##Building Model Specifications
+## Building Model Specifications
 I've created model specifications below.  These will be used in a workflow for each model. For all except for glmnet - I need to specify the mode - classification.
+
   * Penalized Logistic Regression
   * Random Forest
   * XGBoost
@@ -219,15 +254,15 @@ I've created model specifications below.  These will be used in a workflow for e
 glm_spec <-
   logistic_reg(penalty = tune(),
                mixture = tune() # range from 0 to 1, with 1 being a pure Lasso model
-                        ) %>% 
+               ) |>
   set_engine("glmnet")
 
 rf_spec <- 
    rand_forest(mtry = tune(), 
                min_n = tune(), 
                trees = 1000 # trees of 1000 should be sufficient
-               ) %>% 
-   set_engine("ranger") %>% 
+               ) |> 
+   set_engine("ranger") |> 
    set_mode("classification")
 
 xgb_spec <- 
@@ -238,25 +273,26 @@ xgb_spec <-
               loss_reduction = tune(), 
               mtry = tune(),
               sample_size = tune()
-              ) %>% 
-   set_engine("xgboost") %>% 
+              ) |>
+   set_engine("xgboost") |> 
    set_mode("classification")
 
 svm_spec <- 
-  svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
-  set_engine("kernlab") %>% 
+  svm_rbf(cost = tune(), rbf_sigma = tune()) |>
+  set_engine("kernlab") |>
   set_mode("classification")
 
 knn_spec <- 
    nearest_neighbor(neighbors = tune(), 
                     dist_power = tune(), 
-                    weight_func = tune()) %>% 
-   set_engine("kknn") %>% 
+                    weight_func = tune()) |> 
+   set_engine("kknn") |> 
    set_mode("classification")
 
 ```
 
-##Penalized Logistic Regression
+# Modeling
+## Penalized Logistic Regression
 Create a workflow
 ```{r glm_workflow}
 glmnet_wf <- 
@@ -293,11 +329,13 @@ options(scipen = 4)
 glmnet_tune |>
   collect_metrics() |>
   filter(.metric == "roc_auc") |>
-  arrange(-mean,penalty, mixture)
+  arrange(-mean,penalty, mixture) |>
+  head(10) |>
+  kable()
 ```
 
 Plot of tuning results
-```{r glm_plot}
+```{r glm_plot, warning=FALSE, width = 12}
 glmnet_tune %>%
   collect_metrics() %>%
   mutate(mixture = factor(mixture)) %>%
@@ -308,6 +346,7 @@ glmnet_tune %>%
   scale_x_log10(labels = scales::label_number()) +
   scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
 ```
+
 Lower penalties seem to do well, however mixture isn't quite as clear - they all have rocs_aucs of around 0.83 and 0.84 Smaller penalties appear to do better, so I can re-tune and define a range of values for penalty.
 ```{r glm_retuned_model, cache=TRUE}
 # rebuild the grid
@@ -333,19 +372,23 @@ options(scipen = 9)
 glmnet_retune |>
   collect_metrics() |>
   filter(.metric == "roc_auc") |>
-  arrange(-mean,penalty, mixture)
+  arrange(-mean,penalty, mixture) |>
+  head(10) |>
+  kable()
 
 ```
 Not much of a change using smaller penalties, but a mixture of 1 (pure lasso) appears to be the best.
 
 Select the best parameters
 ```{r glm_best}
+options(scipen = 9)
 best_glmnet <- glmnet_retune %>%
   select_best("roc_auc")
 best_glmnet
 ```
 
-###Finalized glmnet model
+Finalized glmnet model
+
 Create a workflow using the best penalty and mixture - a low penalty and a pure lasso regularization.
 ```{r glm_final_workflow}
 glmnet_wf <- 
@@ -354,6 +397,7 @@ glmnet_wf <-
 ```
 
 Final Model
+
 * last_fit() emulates the process where, after determining the best model - aka from final_wf, the final fit on the entire training set is needed and is then evaluated on the test set.
 ```{r glm_final_model, warning=FALSE,cache=TRUE}
 glmnet_final <- 
@@ -372,9 +416,8 @@ glmnet_final %>%
   roc_curve(Churn, .pred_No) %>% 
   autoplot()
 ```
-Best roc_auc is 85.8
 
-##Random Forest
+## Random Forest
 Create a workflow
 ```{r rf_workflow}
 rf_wf <- 
@@ -384,8 +427,9 @@ rf_wf <-
 ```
 
 Tuning the Hyperparameters
+
 * This will be trained a bit differently than glmnet  RF models tend to perform well without tuning, but it doesn't hurt to explore a bit. I'll be using tune_grid initially instead of grid_regular for this tuning process
-```{r rf_initial_model, cache=TRUE}
+```{r rf_initial_model, cache=TRUE, warning = FALSE}
 doParallel::registerDoParallel()
 
 set.seed(12542)
@@ -403,9 +447,9 @@ Metrics
 rf_tune |>
   collect_metrics() |>
   filter(.metric == "roc_auc") |>
-  arrange(-mean)
-
-rf_tune |> select_best("roc_auc")
+  arrange(-mean) |>
+  head(10) |>
+  kable()
 ```
 
 Plots
@@ -425,6 +469,7 @@ rf_tune %>%
 
 autoplot(rf_tune)
 ```
+
 Generally it looks like a min_n between 23 and 33 and an mtry between 3 and 9
 
 Now that we have a range of values to use, grid_regular can be utilized.
@@ -458,6 +503,7 @@ rf_retune %>%
   scale_x_continuous(breaks = seq(0, 12, by = 1))
 
 ```
+
 An mtry of 4 and a min_n of 33 perform the best
 
 Best Model
@@ -486,9 +532,8 @@ saveRDS(rf_final, file = "Saved_Model_Results/rf_final.rds")
 rf_final %>%
   collect_metrics()
 
-rf_final |> collect_predictions()
+
 ```
-ROC_AUC is 85.3, worse than regularized logistic - 85.8
 
 ```{r rf_conf_mat}
 conf_mat_resampled(rf_final)
@@ -510,10 +555,12 @@ workflow() |>
   pull_workflow_fit() |>
   vip(geom = "point")
 ```
+
 Tenure and TotalCharges are important, but they're definitely correlated - TotalCharges is the product of tenure and MonthlyCharges.  Fiber Optic is also important as well as Monthly Charges - which by itself is a good indicator
 
-###XGBoost
-Arguments for the xgboost
+## XGBoost
+Arguments for the xgboost 
+
 * mtry - same as rf; the number of predictors that are randomly sampled at each split
 * trees - same as rf; the number of trees in the ensemble
 * min_n - same as rf; the minimum number of data points in a node that is required for a node to be split further
@@ -522,9 +569,8 @@ Arguments for the xgboost
 * loss_reduction - a number for the reduction in the loss function required to split further
 * sample_size - the number of data that is exposed to the fitting routine
 
-####Create a grid
-This method is a little bit different than the others since we have 6 hyperparameters
-Instead of making a grid and trying all the values or racing, we're going to create a grid that covers the parameter space and fills the 6-d space in such a way that all the different parts are spread out evenly
+#### Create a grid
+This method is a little bit different than the others since we have 6 hyperparameters.  Instead of making a grid and trying all the values or racing, we're going to create a grid that covers the parameter space and fills the 6-d space in such a way that all the different parts are spread out evenly
 ```{r xgb_grid, cache = TRUE}
 xgb_grid <- grid_latin_hypercube(
   tree_depth(),
@@ -541,10 +587,11 @@ xgb_grid <- grid_latin_hypercube(
 Alternatively, a racing method could be used
 
 Racing methods:
-* these are efficient approaches to grid search.  Initially the function evaluates all tuning parameters on a small initial set of resamples
-* the performance stats from these resamples are analyzed to determine which tuning params are NOT statistically different from the current best setting.  If a param is different, it's excluded from further resampling
-* the next resample is used with the remaining parameter combinations and the statistical analysis is updated.  More candidate parameters may be excluded with each new resample that is processed
-* this function determines statistical significance using a repeated measure of an ANOVA model where the performance statistic - in this case accuracy - is the outcome data and the random effect is resamples
+
+  * these are efficient approaches to grid search.  Initially the function evaluates all tuning parameters on a small initial set of resamples
+  * the performance stats from these resamples are analyzed to determine which tuning params are NOT statistically different from the current best setting.  If a param is different, it's excluded from further resampling
+  * the next resample is used with the remaining parameter combinations and the statistical analysis is updated.  More candidate parameters may be excluded with each new resample that is processed
+  * this function determines statistical significance using a repeated measure of an ANOVA model where the performance statistic - in this case accuracy - is the outcome data and the random effect is resamples
 
 We are taking the 10 resamples from cross validation.  It picks one set of hyperparameters and tries that with all the resamples. Then ANOVA is used to decide if any of them are statistically much worse and those are thrown away.  It keeps going until it figures out which ones are best.
 
@@ -568,6 +615,7 @@ We don't evaluate all 15 hyperparameter combinations on all 10 resamples.  It's 
 
 ```
 
+Create a workflow
 ```{r xgb_workflow}
 xgb_wf <- 
   workflow() |> 
@@ -575,6 +623,7 @@ xgb_wf <-
   add_recipe(model_recipe_no_norm)
 ```
 
+Tune the model
 ```{r xgb_initial_model, cache = TRUE}
 doParallel::registerDoParallel()
 
@@ -590,9 +639,8 @@ saveRDS(xgb_tune, file = "Saved_Model_Results/xgb_initial_tune.rds")
   
 ```
 
-```{r xgb_plot}
-autoplot(xgb_tune) + theme_minimal()
-
+Plots
+```{r xgb_plot, fig.height = 9, fig.width = 12}
 xgb_tune %>%
   collect_metrics() %>%
   filter(.metric == "roc_auc") %>%
@@ -610,8 +658,8 @@ autoplot(xgb_tune)
 This plot shows the results of each.  There's not really an indication of a range for each argument - maybe a higher tree_depth.  For example, it's hard to tell if a higher or lower mtry will give us a higher mean, generally.
 
 We can look at the parameters for the best models based on accuracy and roc_auc
-```{r xgb_metrics}
-show_best(xgb_tune, "roc_auc")
+```{r xgb_metrics, width = 14}
+show_best(xgb_tune, "roc_auc") |> kable()
 best_xgb <- select_best(xgb_tune, "roc_auc")
 
 ```
@@ -638,6 +686,7 @@ xgb_final %>%
   roc_curve(Churn, .pred_No) %>% 
   autoplot()
 ```
+
 The best roc_auc was 85.65, which is slightly worse than penalized logistic regression
 
 ```{r xgb_conf_mat}
@@ -658,6 +707,7 @@ workflow() |>
   vip(geom = "point")
 
 ```
+
 Tenure, Fiber_Optic, and 2-year contract are the most important
 
 ```{rexg_vip 2}
@@ -668,12 +718,12 @@ extract_workflow(xgb_final) |>
 
 ## SVM
 Model information
-* The fundamental idea behind SVMs is to find a hyperplane that best seprates the data into different classes.
-* It aims to find the hyperplane with the maximum margin - which is the distance between the hyperplane and the nearest data point from each class.  A larger margin indicates better generalization to new data.
-* The data points closest to the hyperplane and influence the position and orientation of the hyperplane are called support vectors.  These are critical points that define the margin
-* The radial basis function kernal defines a similarity measure between data points based on Euclidean distance
-* RBF is used to capture complex or non-linear relationships
 
+  * The fundamental idea behind SVMs is to find a hyperplane that best separates the data into different classes.
+  * It aims to find the hyperplane with the maximum margin - which is the distance between the hyperplane and the nearest data point from each class.  A larger margin indicates better generalization to new data.
+  * The data points closest to the hyperplane and influence the position and orientation of the hyperplane are called support vectors.  These are critical points that define the margin
+  * The radial basis function kernel defines a similarity measure between data points based on Euclidean distance
+  * RBF is used to capture complex or non-linear relationships
 
 ```{r svm_wf}
 svm_wf <- 
@@ -683,12 +733,11 @@ svm_wf <-
     
 ```
 
-Levels of 5 indicate that a 5x5 matrix will be created
 ```{r svm_grid}
 svm_grid <- grid_regular(cost(),
                           rbf_sigma(),
                           levels = 7)
-svm_grid
+head(svm_grid,10) |> kable()
 
 ```
 
@@ -709,12 +758,11 @@ saveRDS(svm_tune, file = "Saved_Model_Results/svm_initial_tune.rds")
 
 
 ```{r svm_metrics}
-collect_metrics(svm_tune) |> filter(.metric == "roc_auc") |> arrange(-mean)
-
+collect_metrics(svm_tune) |> filter(.metric == "roc_auc") |> arrange(-mean) |> head(10) |> kable()
 ```
 
 ```{r svm_best}
-show_best(svm_tune, "roc_auc")
+show_best(svm_tune, "roc_auc") |> kable()
 best_svm <- select_best(svm_tune, "roc_auc")
 ```
 
@@ -730,16 +778,14 @@ saveRDS(svm_final, file = "Saved_Model_Results/svm_final.rds")
 
 ```{r svm_final_metrics}
 collect_metrics(svm_final)
-
-collect_predictions(svm_final) |> filter(.pred_class == 'No')
 ```
-Every .pred_class for the predictions is No, which is troubling.  Accuracy is 84.5, which is lower than the others
 
-##K-Nearest Neighbor
-Here are the arguments that will be tuned:
-* Neighbors: an integer for the number of neighbors to consider - default is 5
-* weight_function: indicates the kernal function - "rectangular", "triangular", "epanechnikov", "biweight", "triweight", "cos", "inv", "gaussian", "rank", or "optimal"
-* dist_power: a single number used in calculating the Minkowski distance.  This parameter influences the sensitivity of the distance metric to different features - 1 is the manhattan distance, 2 is Euclidean
+## K-Nearest Neighbor
+Here are the arguments that will be tuned: 
+
+  * Neighbors: an integer for the number of neighbors to consider - default is 5
+  * weight_function: indicates the kernal function - "rectangular", "triangular", "epanechnikov", "biweight", "triweight", "cos", "inv", "gaussian", "rank", or "optimal"
+  * dist_power: a single number used in calculating the Minkowski distance.  This parameter influences the sensitivity of the distance metric to different features - 1 is the manhattan distance, 2 is Euclidean
 
 recipe knn_spec <- nearest_neighbor(neighbors = tune(), dist_power = tune(), weight_func = tune()) %>% set_engine("kknn") %>% set_mode("classification")
 
@@ -755,7 +801,7 @@ knn_grid <- grid_regular(neighbors(),
                          dist_power(),
                          weight_func(),
                          levels = 4)
-knn_grid
+head(knn_grid,10)
 ```
 
 ```{r knn_tuning}
@@ -773,7 +819,7 @@ saveRDS(knn_tune, file = "Saved_Model_Results/knn_initial_tune.rds")
 ```
 
 Since the grid only had 4 levels, only 4 of the 10 distance weighting functions were included.  Rectangular performs the best and more neighbors perform better across the board. Dist power doesn't appear to matter much.
-```{r knn_plot}
+```{r knn_plot, fig.height = 9, fig.width = 12}
 autoplot(knn_tune)
 ```
 
@@ -793,12 +839,18 @@ knn_retune <-
     )
 saveRDS(knn_retune, file = "Saved_Model_Results/knn_retuned.rds")
 
-autoplot(knn_retune)
+#autoplot(knn_retune)
 
 ```
+
+```{r plots, fig.height = 9, fig.width = 14}
+autoplot(knn_retune)
+```
+
+
 A Minkowskis distance of 1 indicates Manhattan distance and 43 neighbors has the best roc_auc, 36 neighbors has the best accuracy, so there's a bit of a tradeoff
 ```{r knn_new_metrics}
-collect_metrics(knn_retune) |> filter(.metric == "roc_auc") |> arrange(-mean)
+collect_metrics(knn_retune) |> filter(.metric == "roc_auc") |> arrange(-mean) |> head(10)
 ```
 
 ```{r best_knn}
@@ -820,9 +872,8 @@ saveRDS(knn_final, file = "Saved_Model_Results/knn_final.rds")
 ```{r knn_final_metrics}
 collect_metrics(knn_final)
 ```
-The best roc_auc is 0.841
 
-#Bringing it all together
+# Bringing it all together
 ```{r everything}
 
 
@@ -834,7 +885,8 @@ model_results <- rbind(
   collect_metrics(knn_final) |> select(.metric, .estimate) |> mutate(model = 'knn')
 )
 
-model_results |> arrange(desc(.metric),desc(.estimate))
+model_results |> arrange(desc(.metric),desc(.estimate)) |> kable(align = 'c', caption = "All Model Results")
   
 ```
- The lasso model produced the best Area Under the ROC curve and accuracy.
+
+The lasso model produced the best area under the ROC curve and XGBoost produced the best accuracy.  The area under the ROC curve is just slightly better than XGB

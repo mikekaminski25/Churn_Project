@@ -1,0 +1,8 @@
+/* styles.css */
+
+/* Adjust the max-width to your preferred value */
+.output {
+  max-width: 800px; /* Set your desired width here */
+  margin-left: auto;
+  margin-right: auto;
+}
